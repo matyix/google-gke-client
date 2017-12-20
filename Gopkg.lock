@@ -29,7 +29,7 @@
   branch = "master"
   name = "google.golang.org/api"
   packages = ["container/v1","gensupport","googleapi","googleapi/internal/uritemplates"]
-  revision = "6b7ad74b94d9a82bba8cc567eafc779770be4bed"
+  revision = "cf39d2072c48ea15238bddbc2caac7dfec109a04"
 
 [[projects]]
   name = "google.golang.org/appengine"
