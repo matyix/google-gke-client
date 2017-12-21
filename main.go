@@ -5,18 +5,19 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
-	"time"
 
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 	gke "google.golang.org/api/container/v1"
+	"io/ioutil"
+	"strings"
+	"time"
 )
 
 var (
 	projectID = flag.String("project", "", "Project ID")
 	zone      = flag.String("zone", "", "Compute zone")
-	credPath  = flag.String("credPath", "", "Credential path")
+	ops       = flag.String("ops", "", "Operation not specified - should be c -create, d -delete, u -update. Default is list")
 )
 
 const (
@@ -29,7 +30,7 @@ const (
 // Struct of GKE
 type GKECluster struct {
 	// ProjectID is the ID of your project to use when creating a cluster
-	ProjectID string
+	ProjectID string `json:"projectId,omitempty"`
 	// The zone to launch the cluster
 	Zone string
 	// The IP address range of the container pods
@@ -74,6 +75,8 @@ type GKECluster struct {
 	LegacyAbac bool
 	// NodePool id
 	NodePoolID string
+	// Image Type
+	ImageType string
 }
 
 func main() {
@@ -89,10 +92,16 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-
-	if *credPath == "" {
+	if *ops == "" {
 		fmt.Fprintln(os.Stderr, "-zone flag missing")
 		flag.Usage()
+	}
+
+	credentialPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	log.Printf(os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+	data, err := ioutil.ReadFile(credentialPath)
+	if err != nil {
+		log.Fatal("GOOGLE_APPLICATION_CREDENTIALS env var is not specified", err)
 	}
 
 	svc, err := getServiceClient()
@@ -100,22 +109,29 @@ func main() {
 		log.Fatalf("Could not initialize gke client: %v", err)
 	}
 
-	if err := ListClusters(svc, *projectID, *zone); err != nil {
-		log.Fatal(err)
+	cluster := GKECluster{
+		ProjectID:         *projectID,
+		Zone:              *zone,
+		Name:              "kluszterfirst",
+		NodeCount:         1,
+		CredentialPath:    credentialPath,
+		CredentialContent: string(data),
 	}
 
-	cluster := GKECluster{}
-
-	cluster.ProjectID = *projectID
-	cluster.Zone = *zone
-
-	cluster.Name = "kluszterfirst"
-	cluster.NodeCount = 4
-
-	//cluster.CreateCluster(svc)
-	cluster.UpdateCluster(svc)
-	//cluster.DeleteCluster(svc)
-
+	switch *ops {
+	case "c":
+		log.Println("Create cluster.")
+		cluster.CreateCluster(svc)
+	case "d":
+		log.Println("Delete cluster.")
+		cluster.DeleteCluster(svc)
+	case "u":
+		fmt.Println("Update cluster.")
+		cluster.UpdateCluster(svc)
+	default:
+		fmt.Println("List cluster.")
+		cluster.ListClusters(svc)
+	}
 }
 
 func getServiceClient() (*gke.Service, error) {
@@ -138,15 +154,15 @@ func getServiceClient() (*gke.Service, error) {
 	return service, nil
 }
 
-func ListClusters(svc *gke.Service, projectID, zone string) error {
-	list, err := svc.Projects.Zones.Clusters.List(projectID, zone).Do()
+func (cc *GKECluster) ListClusters(svc *gke.Service) error {
+	list, err := svc.Projects.Zones.Clusters.List(cc.ProjectID, cc.Zone).Do()
 	if err != nil {
 		return fmt.Errorf("failed to list clusters: %v", err)
 	}
 	for _, v := range list.Clusters {
 		fmt.Printf("Cluster %q (%s) master_version: v%s", v.Name, v.Status, v.CurrentMasterVersion)
 
-		poolList, err := svc.Projects.Zones.Clusters.NodePools.List(projectID, zone, v.Name).Do()
+		poolList, err := svc.Projects.Zones.Clusters.NodePools.List(cc.ProjectID, cc.Zone, v.Name).Do()
 		if err != nil {
 			return fmt.Errorf("failed to list node pools for cluster %q: %v", v.Name, err)
 		}
@@ -240,10 +256,7 @@ func (cc *GKECluster) UpdateCluster(svc *gke.Service) error {
 	return nil
 }
 
-func (cc *GKECluster) DeleteCluster(svc *gke.Service, projectID, zone string) error {
-
-	cc.ProjectID = projectID
-	cc.Zone = zone
+func (cc *GKECluster) DeleteCluster(svc *gke.Service) error {
 
 	log.Printf("Removing cluster %v from project %v, zone %v", cc.Name, cc.ProjectID, cc.Zone)
 	deleteCall, err := svc.Projects.Zones.Clusters.Delete(cc.ProjectID, cc.Zone, cc.Name).Context(context.Background()).Do()
@@ -270,7 +283,7 @@ func (cc *GKECluster) waitForCluster(svc *gke.Service) error {
 			return nil
 		}
 		if cluster.Status != message {
-			log.Printf("%v cluster %v......", string(cluster.Status), cc.Name)
+			log.Printf("%v cluster %v", string(cluster.Status), cc.Name)
 			message = cluster.Status
 		}
 		time.Sleep(time.Second * 5)
