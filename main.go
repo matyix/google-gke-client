@@ -16,6 +16,7 @@ import (
 var (
 	projectID = flag.String("project", "", "Project ID")
 	zone      = flag.String("zone", "", "Compute zone")
+	credPath  = flag.String("credPath", "", "Credential path")
 )
 
 const (
@@ -89,6 +90,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *credPath == "" {
+		fmt.Fprintln(os.Stderr, "-zone flag missing")
+		flag.Usage()
+	}
+
 	svc, err := getServiceClient()
 	if err != nil {
 		log.Fatalf("Could not initialize gke client: %v", err)
@@ -99,10 +105,16 @@ func main() {
 	}
 
 	cluster := GKECluster{}
+
+	cluster.ProjectID = *projectID
+	cluster.Zone = *zone
+
 	cluster.Name = "kluszterfirst"
-	cluster.NodeCount = 2
-	//cluster.CreateCluster(svc, *projectID, *zone)
-	cluster.DeleteCluster(svc, *projectID, *zone)
+	cluster.NodeCount = 4
+
+	//cluster.CreateCluster(svc)
+	cluster.UpdateCluster(svc)
+	//cluster.DeleteCluster(svc)
 
 }
 
@@ -146,13 +158,11 @@ func ListClusters(svc *gke.Service, projectID, zone string) error {
 	return nil
 }
 
-func (cc *GKECluster) CreateCluster(svc *gke.Service, projectID, zone string) error {
+func (cc *GKECluster) CreateCluster(svc *gke.Service) error {
 
-	cc.ProjectID = projectID
-	cc.Zone = zone
 	cc.validate()
 
-	fmt.Printf("Cluster request: %v", cc.generateClusterCreateRequest())
+	log.Printf("Cluster request: %v", cc.generateClusterCreateRequest())
 	createCall, err := svc.Projects.Zones.Clusters.Create(cc.ProjectID, cc.Zone, cc.generateClusterCreateRequest()).Context(context.Background()).Do()
 
 	fmt.Printf("Cluster request submitted: %v", cc.generateClusterCreateRequest())
@@ -166,6 +176,68 @@ func (cc *GKECluster) CreateCluster(svc *gke.Service, projectID, zone string) er
 	}
 
 	return cc.waitForCluster(svc)
+}
+
+func (cc *GKECluster) UpdateCluster(svc *gke.Service) error {
+
+	log.Printf("Updating cluster. MasterVersion: %s, NodeVersion: %s, NodeCount: %v", cc.MasterVersion, cc.NodeVersion, cc.NodeCount)
+	if cc.NodePoolID == "" {
+		cluster, err := svc.Projects.Zones.Clusters.Get(cc.ProjectID, cc.Zone, cc.Name).Context(context.Background()).Do()
+		if err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+		cc.NodePoolID = cluster.NodePools[0].Name
+	}
+
+	if cc.MasterVersion != "" {
+		log.Printf("Updating master to %v version", cc.MasterVersion)
+		updateCall, err := svc.Projects.Zones.Clusters.Update(cc.ProjectID, cc.Zone, cc.Name, &gke.UpdateClusterRequest{
+			Update: &gke.ClusterUpdate{
+				DesiredMasterVersion: cc.MasterVersion,
+			},
+		}).Context(context.Background()).Do()
+		if err != nil {
+			return err
+		}
+		log.Printf("Cluster %s update is called for project %s and zone %s. Status Code %v", cc.Name, cc.ProjectID, cc.Zone, updateCall.HTTPStatusCode)
+		if err := cc.waitForCluster(svc); err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+	}
+
+	if cc.NodeVersion != "" {
+		log.Printf("Updating node to %v verison", cc.NodeVersion)
+		updateCall, err := svc.Projects.Zones.Clusters.NodePools.Update(cc.ProjectID, cc.Zone, cc.Name, cc.NodePoolID, &gke.UpdateNodePoolRequest{
+			NodeVersion: cc.NodeVersion,
+		}).Context(context.Background()).Do()
+		if err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+		log.Printf("Nodepool %s update is called for project %s, zone %s and cluster %s. Status Code %v", cc.NodePoolID, cc.ProjectID, cc.Zone, cc.Name, updateCall.HTTPStatusCode)
+		if err := cc.waitForNodePool(svc); err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+	}
+
+	if cc.NodeCount != 0 {
+		log.Printf("Updating node size to %v", cc.NodeCount)
+		updateCall, err := svc.Projects.Zones.Clusters.NodePools.SetSize(cc.ProjectID, cc.Zone, cc.Name, cc.NodePoolID, &gke.SetNodePoolSizeRequest{
+			NodeCount: cc.NodeCount,
+		}).Context(context.Background()).Do()
+		if err != nil {
+			return err
+		}
+		log.Printf("Nodepool %s size change is called for project %s, zone %s and cluster %s. Status Code %v", cc.NodePoolID, cc.ProjectID, cc.Zone, cc.Name, updateCall.HTTPStatusCode)
+		if err := cc.waitForCluster(svc); err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+	}
+	return nil
 }
 
 func (cc *GKECluster) DeleteCluster(svc *gke.Service, projectID, zone string) error {
@@ -198,8 +270,27 @@ func (cc *GKECluster) waitForCluster(svc *gke.Service) error {
 			return nil
 		}
 		if cluster.Status != message {
-			log.Printf("%v cluster %v......", strings.ToLower(cluster.Status), cc.Name)
+			log.Printf("%v cluster %v......", string(cluster.Status), cc.Name)
 			message = cluster.Status
+		}
+		time.Sleep(time.Second * 5)
+	}
+}
+
+func (cc *GKECluster) waitForNodePool(svc *gke.Service) error {
+	message := ""
+	for {
+		nodepool, err := svc.Projects.Zones.Clusters.NodePools.Get(cc.ProjectID, cc.Zone, cc.Name, cc.NodePoolID).Context(context.TODO()).Do()
+		if err != nil {
+			return err
+		}
+		if nodepool.Status == statusRunning {
+			log.Printf("Nodepool %v is running", cc.Name)
+			return nil
+		}
+		if nodepool.Status != message {
+			log.Printf("%v nodepool %v", string(nodepool.Status), cc.NodePoolID)
+			message = nodepool.Status
 		}
 		time.Sleep(time.Second * 5)
 	}
