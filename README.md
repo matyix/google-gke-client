@@ -27,11 +27,6 @@ Once gcloud is installed the easiest way is to authenticate from where running t
 
 #### Clusters
 
-You can `create`, `delete` and `update` clusters with: 
-
-```
-./gke-test -project $PROJECT_ID -zone us-central1-a -ops l
-```
-You can use `c -create`, `d -delete`, `u -update` and for `l -list`.
+You can `create`, `delete` and `update` clusters.
 
 
