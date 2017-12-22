@@ -1,5 +1,3 @@
-Not applicable
-
 #### Authentication - service account (recommended)
 
 On the console create a service acount for Kuberentes Engine.
