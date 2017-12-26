@@ -3,15 +3,14 @@ package client
 import (
 	"flag"
 	"fmt"
-	"log"
-	"os"
+	"github.com/banzaicloud/google-gke-client/cluster"
+	"github.com/banzaicloud/google-gke-client/utils"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
-	"github.com/matyix/gke-test/cluster"
-	"github.com/matyix/gke-test/utils"
-	"strings"
 	gke "google.golang.org/api/container/v1"
-
+	"log"
+	"os"
+	"strings"
 )
 
 var (
@@ -156,5 +155,3 @@ func DeleteCluster(svc *gke.Service, cc cluster.GKECluster) error {
 	os.RemoveAll(cc.TempCredentialPath)
 	return nil
 }
-
-

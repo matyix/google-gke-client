@@ -1,7 +1,8 @@
 package cluster
 
-import gke "google.golang.org/api/container/v1"
-
+import (
+	gke "google.golang.org/api/container/v1"
+)
 
 // Struct of GKE
 type GKECluster struct {
