@@ -51,6 +51,7 @@ import (
 	statpb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Server is an in-memory Cloud Bigtable fake.
@@ -162,7 +163,7 @@ func (s *server) DeleteTable(ctx context.Context, req *btapb.DeleteTableRequest)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.tables[req.Name]; !ok {
-		return nil, grpc.Errorf(codes.NotFound, "table %q not found", req.Name)
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.Name)
 	}
 	delete(s.tables, req.Name)
 	return &emptypb.Empty{}, nil
@@ -224,7 +225,7 @@ func (s *server) DropRowRange(ctx context.Context, req *btapb.DropRowRangeReques
 	defer s.mu.Unlock()
 	tbl, ok := s.tables[req.Name]
 	if !ok {
-		return nil, grpc.Errorf(codes.NotFound, "table %q not found", req.Name)
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.Name)
 	}
 
 	if req.GetDeleteAllDataFromTable() {
@@ -266,12 +267,50 @@ func (s *server) DropRowRange(ctx context.Context, req *btapb.DropRowRangeReques
 	return &emptypb.Empty{}, nil
 }
 
+// This is a private alpha release of Cloud Bigtable replication. This feature
+// is not currently available to most Cloud Bigtable customers. This feature
+// might be changed in backward-incompatible ways and is not recommended for
+// production use. It is not subject to any SLA or deprecation policy.
+func (s *server) GenerateConsistencyToken(ctx context.Context, req *btapb.GenerateConsistencyTokenRequest) (*btapb.GenerateConsistencyTokenResponse, error) {
+	// Check that the table exists.
+	_, ok := s.tables[req.Name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.Name)
+	}
+
+	return &btapb.GenerateConsistencyTokenResponse{
+		ConsistencyToken: "TokenFor-" + req.Name,
+	}, nil
+}
+
+// This is a private alpha release of Cloud Bigtable replication. This feature
+// is not currently available to most Cloud Bigtable customers. This feature
+// might be changed in backward-incompatible ways and is not recommended for
+// production use. It is not subject to any SLA or deprecation policy.
+func (s *server) CheckConsistency(ctx context.Context, req *btapb.CheckConsistencyRequest) (*btapb.CheckConsistencyResponse, error) {
+	// Check that the table exists.
+	_, ok := s.tables[req.Name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.Name)
+	}
+
+	// Check this is the right token.
+	if req.ConsistencyToken != "TokenFor-"+req.Name {
+		return nil, status.Errorf(codes.InvalidArgument, "token %q not valid", req.ConsistencyToken)
+	}
+
+	// Single cluster instances are always consistent.
+	return &btapb.CheckConsistencyResponse{
+		Consistent: true,
+	}, nil
+}
+
 func (s *server) ReadRows(req *btpb.ReadRowsRequest, stream btpb.Bigtable_ReadRowsServer) error {
 	s.mu.Lock()
 	tbl, ok := s.tables[req.TableName]
 	s.mu.Unlock()
 	if !ok {
-		return grpc.Errorf(codes.NotFound, "table %q not found", req.TableName)
+		return status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
 
 	// Rows to read can be specified by a set of row keys and/or a set of row ranges.
@@ -623,10 +662,10 @@ func (s *server) MutateRow(ctx context.Context, req *btpb.MutateRowRequest) (*bt
 	tbl, ok := s.tables[req.TableName]
 	s.mu.Unlock()
 	if !ok {
-		return nil, grpc.Errorf(codes.NotFound, "table %q not found", req.TableName)
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
 	fs := tbl.columnFamilies()
-	r, _ := tbl.mutableRow(string(req.RowKey))
+	r, _ := tbl.mutableRow(string(req.RowKey), true)
 	r.mu.Lock()
 	defer tbl.resortRowIndex() // Make sure the row lock is released before this grabs the table lock
 	defer r.mu.Unlock()
@@ -641,15 +680,19 @@ func (s *server) MutateRows(req *btpb.MutateRowsRequest, stream btpb.Bigtable_Mu
 	tbl, ok := s.tables[req.TableName]
 	s.mu.Unlock()
 	if !ok {
-		return grpc.Errorf(codes.NotFound, "table %q not found", req.TableName)
+		return status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
 	res := &btpb.MutateRowsResponse{Entries: make([]*btpb.MutateRowsResponse_Entry, len(req.Entries))}
 
 	fs := tbl.columnFamilies()
 
-	defer tbl.resortRowIndex()
+	var newRows []*row
 	for i, entry := range req.Entries {
-		r, _ := tbl.mutableRow(string(entry.RowKey))
+		r, isNew := tbl.mutableRow(string(entry.RowKey), false)
+		if isNew {
+			newRows = append(newRows, r)
+		}
+
 		r.mu.Lock()
 		code, msg := int32(codes.OK), ""
 		if err := applyMutations(tbl, r, entry.Mutations, fs); err != nil {
@@ -663,6 +706,12 @@ func (s *server) MutateRows(req *btpb.MutateRowsRequest, stream btpb.Bigtable_Mu
 		r.mu.Unlock()
 	}
 	stream.Send(res)
+	tbl.mu.Lock()
+	if len(newRows) > 0 {
+		tbl.linkNewRowsUnsafe(newRows)
+	}
+	tbl.resortRowIndexUnsafe()
+	tbl.mu.Unlock()
 	return nil
 }
 
@@ -671,13 +720,13 @@ func (s *server) CheckAndMutateRow(ctx context.Context, req *btpb.CheckAndMutate
 	tbl, ok := s.tables[req.TableName]
 	s.mu.Unlock()
 	if !ok {
-		return nil, grpc.Errorf(codes.NotFound, "table %q not found", req.TableName)
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
 	res := &btpb.CheckAndMutateRowResponse{}
 
 	fs := tbl.columnFamilies()
 
-	r, _ := tbl.mutableRow(string(req.RowKey))
+	r, _ := tbl.mutableRow(string(req.RowKey), true)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -824,14 +873,14 @@ func (s *server) ReadModifyWriteRow(ctx context.Context, req *btpb.ReadModifyWri
 	tbl, ok := s.tables[req.TableName]
 	s.mu.Unlock()
 	if !ok {
-		return nil, grpc.Errorf(codes.NotFound, "table %q not found", req.TableName)
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
 	updates := make(map[string]cell) // copy of updated cells; keyed by full column name
 
 	fs := tbl.columnFamilies()
 
 	rowKey := string(req.RowKey)
-	r, isNewRow := tbl.mutableRow(rowKey)
+	r, isNewRow := tbl.mutableRow(rowKey, true)
 	// This must be done before the row lock, acquired below, is released.
 	if isNewRow {
 		defer tbl.resortRowIndex()
@@ -920,7 +969,7 @@ func (s *server) SampleRowKeys(req *btpb.SampleRowKeysRequest, stream btpb.Bigta
 	tbl, ok := s.tables[req.TableName]
 	s.mu.Unlock()
 	if !ok {
-		return grpc.Errorf(codes.NotFound, "table %q not found", req.TableName)
+		return status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
 
 	tbl.mu.RLock()
@@ -1026,7 +1075,7 @@ func (t *table) columnFamilies() map[string]*columnFamily {
 	return cp
 }
 
-func (t *table) mutableRow(row string) (mutRow *row, isNewRow bool) {
+func (t *table) mutableRow(row string, linkNew bool) (mutRow *row, isNewRow bool) {
 	// Try fast path first.
 	t.mu.RLock()
 	r := t.rowIndex[row]
@@ -1041,7 +1090,9 @@ func (t *table) mutableRow(row string) (mutRow *row, isNewRow bool) {
 	if r == nil {
 		r = newRow(row)
 		t.rowIndex[row] = r
-		t.rows = append(t.rows, r)
+		if linkNew {
+			t.rows = append(t.rows, r)
+		}
 	}
 	t.mu.Unlock()
 	return r, true
@@ -1049,8 +1100,16 @@ func (t *table) mutableRow(row string) (mutRow *row, isNewRow bool) {
 
 func (t *table) resortRowIndex() {
 	t.mu.Lock()
-	sort.Sort(byRowKey(t.rows))
+	t.resortRowIndexUnsafe()
 	t.mu.Unlock()
+}
+
+func (t *table) resortRowIndexUnsafe() {
+	sort.Sort(byRowKey(t.rows))
+}
+
+func (t *table) linkNewRowsUnsafe(rows []*row) {
+	t.rows = append(t.rows, rows...)
 }
 
 func (t *table) gc() {
