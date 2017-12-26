@@ -2,10 +2,10 @@ package utils
 
 import (
 	"fmt"
-	"log"
+	"github.com/banzaicloud/google-gke-client/cluster"
 	"golang.org/x/net/context"
-	"github.com/matyix/gke-test/cluster"
 	gke "google.golang.org/api/container/v1"
+	"log"
 	"time"
 )
 

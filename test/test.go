@@ -2,8 +2,8 @@ package test
 
 import (
 	"fmt"
-	"github.com/matyix/gke-test/client"
-	"github.com/matyix/gke-test/cluster"
+	"github.com/banzaicloud/google-gke-client/client"
+	"github.com/banzaicloud/google-gke-client/cluster"
 	"io/ioutil"
 	"log"
 	"os"
