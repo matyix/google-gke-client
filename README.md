@@ -1,3 +1,7 @@
+# Repository permanently moved to [Banzai Cloud](https://github.com/banzaicloud/google-gke-client)
+
+=====================================================================
+
 #### Authentication - service account (recommended)
 
 On the console create a service acount for Kuberentes Engine.
