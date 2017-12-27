@@ -1,0 +1,299 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"os"
+
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2/google"
+	gke "google.golang.org/api/container/v1"
+	"io/ioutil"
+	"strings"
+	"time"
+)
+
+var (
+	projectID = flag.String("project", "", "Project ID")
+	zone      = flag.String("zone", "", "Compute zone")
+	ops       = flag.String("ops", "", "Operation not specified - should be c -create, d -delete, u -update. Default is list")
+)
+
+const (
+	cloudScope        = "https://www.googleapis.com/auth/cloud-platform"
+	monitorWriteScope = "https://www.googleapis.com/auth/monitoring.write"
+	storageReadScope  = "https://www.googleapis.com/auth/devstorage.read_only"
+	statusRunning     = "RUNNING"
+)
+
+
+func main() {
+	flag.Parse()
+
+	if *projectID == "" {
+		fmt.Fprintln(os.Stderr, "-project flag missing")
+		flag.Usage()
+		os.Exit(2)
+	}
+	if *zone == "" {
+		fmt.Fprintln(os.Stderr, "-zone flag missing")
+		flag.Usage()
+		os.Exit(2)
+	}
+	if *ops == "" {
+		fmt.Fprintln(os.Stderr, "-zone flag missing")
+		flag.Usage()
+	}
+
+	credentialPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	log.Printf(os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+	data, err := ioutil.ReadFile(credentialPath)
+	if err != nil {
+		log.Fatal("GOOGLE_APPLICATION_CREDENTIALS env var is not specified", err)
+	}
+
+	svc, err := getServiceClient()
+	if err != nil {
+		log.Fatalf("Could not initialize gke client: %v", err)
+	}
+
+	cluster := GKECluster{
+		ProjectID:         *projectID,
+		Zone:              *zone,
+		Name:              "kluszterfirst",
+		NodeCount:         1,
+		CredentialPath:    credentialPath,
+		CredentialContent: string(data),
+	}
+
+	switch *ops {
+	case "c":
+		log.Println("Create cluster.")
+		cluster.CreateCluster(svc)
+	case "d":
+		log.Println("Delete cluster.")
+		cluster.DeleteCluster(svc)
+	case "u":
+		fmt.Println("Update cluster.")
+		cluster.UpdateCluster(svc)
+	default:
+		fmt.Println("List cluster.")
+		cluster.ListClusters(svc)
+	}
+}
+
+func getServiceClient() (*gke.Service, error) {
+
+	// See https://cloud.google.com/docs/authentication/.
+	// Use GOOGLE_APPLICATION_CREDENTIALS environment variable to specify
+	// a service account key file to authenticate to the API.
+
+	client, err := google.DefaultClient(context.Background(), gke.CloudPlatformScope)
+	if err != nil {
+		log.Fatalf("Could not get authenticated client: %v", err)
+		return nil, err
+	}
+	service, err := gke.New(client)
+	if err != nil {
+		log.Fatalf("Could not initialize gke client: %v", err)
+		return nil, err
+	}
+	log.Printf("Using service acc: %v", service)
+	return service, nil
+}
+
+func (cc *GKECluster) ListClusters(svc *gke.Service) error {
+	list, err := svc.Projects.Zones.Clusters.List(cc.ProjectID, cc.Zone).Do()
+	if err != nil {
+		return fmt.Errorf("failed to list clusters: %v", err)
+	}
+	for _, v := range list.Clusters {
+		fmt.Printf("Cluster %q (%s) master_version: v%s", v.Name, v.Status, v.CurrentMasterVersion)
+
+		poolList, err := svc.Projects.Zones.Clusters.NodePools.List(cc.ProjectID, cc.Zone, v.Name).Do()
+		if err != nil {
+			return fmt.Errorf("failed to list node pools for cluster %q: %v", v.Name, err)
+		}
+		for _, np := range poolList.NodePools {
+			fmt.Printf("  -> Pool %q (%s) machineType=%s node_version=v%s autoscaling=%v", np.Name, np.Status,
+				np.Config.MachineType, np.Version, np.Autoscaling != nil && np.Autoscaling.Enabled)
+		}
+	}
+	return nil
+}
+
+func (cc *GKECluster) CreateCluster(svc *gke.Service) error {
+
+	cc.validate()
+
+	log.Printf("Cluster request: %v", cc.generateClusterCreateRequest())
+	createCall, err := svc.Projects.Zones.Clusters.Create(cc.ProjectID, cc.Zone, cc.generateClusterCreateRequest()).Context(context.Background()).Do()
+
+	fmt.Printf("Cluster request submitted: %v", cc.generateClusterCreateRequest())
+
+	if err != nil && !strings.Contains(err.Error(), "alreadyExists") {
+		log.Printf("Contains error", err)
+		return err
+	}
+	if err == nil {
+		log.Printf("Cluster %s create is called for project %s and zone %s. Status Code %v", cc.Name, cc.ProjectID, cc.Zone, createCall.HTTPStatusCode)
+	}
+
+	return cc.waitForCluster(svc)
+}
+
+func (cc *GKECluster) UpdateCluster(svc *gke.Service) error {
+
+	log.Printf("Updating cluster. MasterVersion: %s, NodeVersion: %s, NodeCount: %v", cc.MasterVersion, cc.NodeVersion, cc.NodeCount)
+	if cc.NodePoolID == "" {
+		cluster, err := svc.Projects.Zones.Clusters.Get(cc.ProjectID, cc.Zone, cc.Name).Context(context.Background()).Do()
+		if err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+		cc.NodePoolID = cluster.NodePools[0].Name
+	}
+
+	if cc.MasterVersion != "" {
+		log.Printf("Updating master to %v version", cc.MasterVersion)
+		updateCall, err := svc.Projects.Zones.Clusters.Update(cc.ProjectID, cc.Zone, cc.Name, &gke.UpdateClusterRequest{
+			Update: &gke.ClusterUpdate{
+				DesiredMasterVersion: cc.MasterVersion,
+			},
+		}).Context(context.Background()).Do()
+		if err != nil {
+			return err
+		}
+		log.Printf("Cluster %s update is called for project %s and zone %s. Status Code %v", cc.Name, cc.ProjectID, cc.Zone, updateCall.HTTPStatusCode)
+		if err := cc.waitForCluster(svc); err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+	}
+
+	if cc.NodeVersion != "" {
+		log.Printf("Updating node to %v verison", cc.NodeVersion)
+		updateCall, err := svc.Projects.Zones.Clusters.NodePools.Update(cc.ProjectID, cc.Zone, cc.Name, cc.NodePoolID, &gke.UpdateNodePoolRequest{
+			NodeVersion: cc.NodeVersion,
+		}).Context(context.Background()).Do()
+		if err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+		log.Printf("Nodepool %s update is called for project %s, zone %s and cluster %s. Status Code %v", cc.NodePoolID, cc.ProjectID, cc.Zone, cc.Name, updateCall.HTTPStatusCode)
+		if err := cc.waitForNodePool(svc); err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+	}
+
+	if cc.NodeCount != 0 {
+		log.Printf("Updating node size to %v", cc.NodeCount)
+		updateCall, err := svc.Projects.Zones.Clusters.NodePools.SetSize(cc.ProjectID, cc.Zone, cc.Name, cc.NodePoolID, &gke.SetNodePoolSizeRequest{
+			NodeCount: cc.NodeCount,
+		}).Context(context.Background()).Do()
+		if err != nil {
+			return err
+		}
+		log.Printf("Nodepool %s size change is called for project %s, zone %s and cluster %s. Status Code %v", cc.NodePoolID, cc.ProjectID, cc.Zone, cc.Name, updateCall.HTTPStatusCode)
+		if err := cc.waitForCluster(svc); err != nil {
+			log.Printf("Contains error", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (cc *GKECluster) DeleteCluster(svc *gke.Service) error {
+
+	log.Printf("Removing cluster %v from project %v, zone %v", cc.Name, cc.ProjectID, cc.Zone)
+	deleteCall, err := svc.Projects.Zones.Clusters.Delete(cc.ProjectID, cc.Zone, cc.Name).Context(context.Background()).Do()
+	if err != nil && !strings.Contains(err.Error(), "notFound") {
+		return err
+	} else if err == nil {
+		log.Printf("Cluster %v delete is called. Status Code %v", cc.Name, deleteCall.HTTPStatusCode)
+	} else {
+		log.Printf("Cluster %s doesn't exist", cc.Name)
+	}
+	os.RemoveAll(cc.TempCredentialPath)
+	return nil
+}
+
+func (cc *GKECluster) waitForCluster(svc *gke.Service) error {
+	message := ""
+	for {
+		cluster, err := svc.Projects.Zones.Clusters.Get(cc.ProjectID, cc.Zone, cc.Name).Context(context.TODO()).Do()
+		if err != nil {
+			return err
+		}
+		if cluster.Status == statusRunning {
+			log.Printf("Cluster %v is running", cc.Name)
+			return nil
+		}
+		if cluster.Status != message {
+			log.Printf("%v cluster %v", string(cluster.Status), cc.Name)
+			message = cluster.Status
+		}
+		time.Sleep(time.Second * 5)
+	}
+}
+
+func (cc *GKECluster) waitForNodePool(svc *gke.Service) error {
+	message := ""
+	for {
+		nodepool, err := svc.Projects.Zones.Clusters.NodePools.Get(cc.ProjectID, cc.Zone, cc.Name, cc.NodePoolID).Context(context.TODO()).Do()
+		if err != nil {
+			return err
+		}
+		if nodepool.Status == statusRunning {
+			log.Printf("Nodepool %v is running", cc.Name)
+			return nil
+		}
+		if nodepool.Status != message {
+			log.Printf("%v nodepool %v", string(nodepool.Status), cc.NodePoolID)
+			message = nodepool.Status
+		}
+		time.Sleep(time.Second * 5)
+	}
+}
+
+func (cc *GKECluster) validate() error {
+	if cc.ProjectID == "" {
+		return fmt.Errorf("project ID is required")
+	} else if cc.Zone == "" {
+		return fmt.Errorf("zone is required")
+	} else if cc.Name == "" {
+		return fmt.Errorf("cluster name is required")
+	}
+	return nil
+}
+
+func (cc *GKECluster) generateClusterCreateRequest() *gke.CreateClusterRequest {
+	request := gke.CreateClusterRequest{
+		Cluster: &gke.Cluster{},
+	}
+	request.Cluster.Name = cc.Name
+	request.Cluster.Zone = cc.Zone
+	request.Cluster.InitialClusterVersion = cc.MasterVersion
+	request.Cluster.InitialNodeCount = cc.NodeCount
+	request.Cluster.ClusterIpv4Cidr = cc.ClusterIpv4Cidr
+	request.Cluster.Description = cc.Description
+	request.Cluster.EnableKubernetesAlpha = cc.EnableAlphaFeature
+	request.Cluster.AddonsConfig = &gke.AddonsConfig{
+		HttpLoadBalancing:        &gke.HttpLoadBalancing{Disabled: !cc.HTTPLoadBalancing},
+		HorizontalPodAutoscaling: &gke.HorizontalPodAutoscaling{Disabled: !cc.HorizontalPodAutoscaling},
+		KubernetesDashboard:      &gke.KubernetesDashboard{Disabled: !cc.KubernetesDashboard},
+		NetworkPolicyConfig:      &gke.NetworkPolicyConfig{Disabled: !cc.NetworkPolicyConfig},
+	}
+	request.Cluster.Network = cc.Network
+	request.Cluster.Subnetwork = cc.SubNetwork
+	request.Cluster.LegacyAbac = &gke.LegacyAbac{
+		Enabled: cc.LegacyAbac,
+	}
+	request.Cluster.MasterAuth = &gke.MasterAuth{
+		Username: "admin",
+	}
+	request.Cluster.NodeConfig = cc.NodeConfig
+	return &request
+}

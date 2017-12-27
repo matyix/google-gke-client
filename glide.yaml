@@ -1,0 +1,11 @@
+package: github.com/banzaicloud/google-gke-client
+import:
+- package: golang.org/x/net
+  subpackages:
+  - context
+- package: golang.org/x/oauth2
+  subpackages:
+  - google
+- package: google.golang.org/api
+  subpackages:
+  - container/v1

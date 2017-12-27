@@ -54,6 +54,29 @@ func TestPrefix(t *testing.T) {
 	}
 }
 
+func TestApplyErrors(t *testing.T) {
+	ctx := context.Background()
+	table := &Table{
+		c: &Client{
+			project:  "P",
+			instance: "I",
+		},
+		table: "t",
+	}
+	f := ColumnFilter("C")
+	m := NewMutation()
+	m.DeleteRow()
+	// Test nested conditional mutations.
+	cm := NewCondMutation(f, NewCondMutation(f, m, nil), nil)
+	if err := table.Apply(ctx, "x", cm); err == nil {
+		t.Error("got nil, want error")
+	}
+	cm = NewCondMutation(f, nil, NewCondMutation(f, m, nil))
+	if err := table.Apply(ctx, "x", cm); err == nil {
+		t.Error("got nil, want error")
+	}
+}
+
 func TestClientIntegration(t *testing.T) {
 	start := time.Now()
 	lastCheckpoint := start
@@ -70,7 +93,7 @@ func TestClientIntegration(t *testing.T) {
 
 	var timeout time.Duration
 	if testEnv.Config().UseProd {
-		timeout = 5 * time.Minute
+		timeout = 10 * time.Minute
 		t.Logf("Running test against production")
 	} else {
 		timeout = 1 * time.Minute
@@ -128,6 +151,11 @@ func TestClientIntegration(t *testing.T) {
 		}
 	}
 	checkpoint("inserted initial data")
+
+	if err := adminClient.WaitForReplication(ctx, table); err != nil {
+		t.Errorf("Waiting for replication for table %q: %v", table, err)
+	}
+	checkpoint("waited for replication")
 
 	// Do a conditional mutation with a complex filter.
 	mutTrue := NewMutation()
